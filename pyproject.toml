@@ -1,0 +1,13 @@
+[project]
+name = "browseragent"
+version = "0.1.0"
+description = "Agentic browser automation tool powered by Gemini + LangGraph + Playwright MCP"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-openai>=0.3.0",
+    "langchain-mcp-adapters>=0.1.0",
+    "langgraph>=0.4.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+]
