@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import shutil
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Callable
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -13,6 +15,10 @@ from langgraph.graph import MessagesState, StateGraph, START
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from browseragent.config import Settings
+
+# Type alias for the recording callback.
+# Signature: (tool_name, tool_args, tool_result) -> None
+RecordCallback = Callable[[str, dict[str, Any], str], None]
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -68,41 +74,55 @@ def _find_npx() -> str:
     return npx
 
 
+def _build_mcp_config(settings: Settings) -> dict[str, Any]:
+    """Return the MCP client configuration dict for Playwright."""
+    npx_path = _find_npx()
+    mcp_args = ["@playwright/mcp@latest", "--browser", "chromium"]
+    if settings.headless:
+        mcp_args.append("--headless")
+    return {
+        "playwright": {
+            "command": npx_path,
+            "args": mcp_args,
+            "transport": "stdio",
+        }
+    }
+
+
+@contextlib.asynccontextmanager
+async def open_mcp_session(
+    settings: Settings,
+) -> AsyncGenerator[list[BaseTool], None]:
+    """Context manager that starts a Playwright MCP session and yields tools.
+
+    This is shared between the LLM agent (record mode) and the replayer so
+    both use the same session-construction logic.
+    """
+    client = MultiServerMCPClient(_build_mcp_config(settings))
+
+    async with client.session("playwright") as session:
+        tools = await load_mcp_tools(session)
+        yield tools
+
+
 async def run_agent_stream(
     url: str,
     task: str,
     settings: Settings,
+    *,
+    record_callback: RecordCallback | None = None,
 ) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
     """Spin up the Playwright MCP server, build the LangGraph agent, and
     stream step-by-step events.
 
     Yields ``(node_name, chunk_data)`` tuples as the agent works.
     The final chunk from the ``"agent"`` node contains the answer.
+
+    If *record_callback* is provided it is called after every tool execution
+    with ``(tool_name, tool_args, tool_result)`` so the caller can record
+    the execution path.
     """
-    npx_path = _find_npx()
-
-    # Build the MCP server args — use bundled Chromium to avoid
-    # conflicts with the user's running Chrome instance
-    mcp_args = ["@playwright/mcp@latest", "--browser", "chromium"]
-    if settings.headless:
-        mcp_args.append("--headless")
-
-    client = MultiServerMCPClient(
-        {
-            "playwright": {
-                "command": npx_path,
-                "args": mcp_args,
-                "transport": "stdio",
-            }
-        }
-    )
-
-    # Use client.session() to maintain a PERSISTENT session across all
-    # tool calls. Without this, each tool call spawns a new Playwright
-    # browser context and all page state is lost.
-    async with client.session("playwright") as session:
-        tools = await load_mcp_tools(session)
-
+    async with open_mcp_session(settings) as tools:
         # --- LLM ---
         llm = ChatOpenAI(
             model=settings.model_name,
@@ -136,6 +156,10 @@ async def run_agent_stream(
             content=f"Target URL: {url}\n\nTask: {task}"
         )
 
+        # Track the most recent AI tool calls so we can pair them with
+        # their ToolMessage results for the recording callback.
+        pending_tool_calls: dict[str, dict[str, Any]] = {}
+
         # --- Stream ---
         async for chunk in graph.astream(
             {"messages": [system_msg, human_msg]},
@@ -143,4 +167,31 @@ async def run_agent_stream(
             stream_mode="updates",
         ):
             for node_name, node_data in chunk.items():
+                messages = node_data.get("messages", [])
+                if not isinstance(messages, list):
+                    messages = [messages]
+
+                # Capture pending tool calls from the agent node
+                if node_name == "agent":
+                    for msg in messages:
+                        if isinstance(msg, AIMessage) and msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                pending_tool_calls[tc["id"]] = {
+                                    "name": tc["name"],
+                                    "args": tc.get("args", {}),
+                                }
+
+                # When tools respond, fire the recording callback
+                if node_name == "tools" and record_callback is not None:
+                    for msg in messages:
+                        if isinstance(msg, ToolMessage):
+                            tc_id = msg.tool_call_id
+                            tc_info = pending_tool_calls.pop(tc_id, None)
+                            if tc_info:
+                                record_callback(
+                                    tc_info["name"],
+                                    tc_info["args"],
+                                    str(msg.content),
+                                )
+
                 yield node_name, node_data
